@@ -1,0 +1,53 @@
+# Local development (logs, sim, Quartus temp, reverse engineering)
+_dev/
+
+# Quartus output (se Quartus rigenera in root)
+output_files/
+db/
+incremental_db/
+*.qws
+*.rpt
+*.smsg
+*.summary
+*.jdi
+*.pin
+*.sof
+*.sld
+*.done
+*.qdf
+c5_pin_model_dump.txt
+
+# Build logs
+*.log
+build_log.txt
+fb_output.log
+
+# Editor / AI tools
+.claude/
+.vscode/
+.idea/
+transcript
+
+# Tcl scripts di analisi temporanei
+_sta_*.tcl
+_sta_*.txt
+
+# Sim temp (se rigenerato in sim/)
+sim/work/
+sim/transcript
+sim/vsim.wlf
+sim/modelsim.ini
+sim/*.log
+sim/*.hex
+
+# ROM binaries (mai committare)
+*.zip
+rom/
+sim/c[0-9]*
+
+# JTAG config locale
+jtag.cdf
+
+# Internal MRA generation tools
+releases/_gen_variants.pl
+releases/_template.mra
