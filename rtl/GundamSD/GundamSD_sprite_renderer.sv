@@ -93,8 +93,8 @@ module GundamSD_sprite_renderer (
 	// Valid pixel = pen != 0xF (sentinel "no sprite") — usiamo 0xF come "vuoto"
 	// perché pen 15 reale = trasparente (skipped al draw).
 	localparam [13:0] LB_EMPTY = 14'h003F;  // color=0, pri=0, pen=15 (trasparente)
-	reg [13:0] linebuf0 [0:319];
-	reg [13:0] linebuf1 [0:319];
+	(* ramstyle = "M10K" *) reg [13:0] linebuf0 [0:319];
+	(* ramstyle = "M10K" *) reg [13:0] linebuf1 [0:319];
 	reg        active_buf;
 
 	// ─── Sprite scan FSM ─────────────────────────────────────────────────────
@@ -114,6 +114,7 @@ module GundamSD_sprite_renderer (
 	localparam SC_NEXT_TX  = 4'd11;
 	localparam SC_NEXT_E   = 4'd12;
 	localparam SC_DONE     = 4'd13;
+	localparam SC_ROM_ADDR = 4'd14;   // stadio pipeline: registra cur_tile (spezza il path lungo)
 
 	reg [3:0] sc_state;
 	reg [7:0] entry_idx;       // 0..255
@@ -162,6 +163,20 @@ module GundamSD_sprite_renderer (
 	reg [31:0] pf_rom_data;
 	reg  [3:0] decode_step;
 	wire  [3:0] eff_tile_x = sp_flipx ? (sp_w - 4'd1 - tile_x_pf) : tile_x_pf;
+
+	// PIPELINE rom_addr: cur_tile (mult 4x4 + 2 somme 14-bit) e eff_row registrati
+	// in uno stadio dedicato (SC_ROM_ADDR). Cosi' SC_ROM_REQ calcola rom_addr solo
+	// con shift+2 somme da valori GIA' registrati -> path corto, chiude a 96 MHz.
+	// Prima erano combinatori nello stesso ciclo di SC_ROM_REQ: rom_addr[17:20]
+	// usciva a slack -0.49 (single-cycle) -> instabile col fitting -> glitch.
+	reg [13:0] cur_tile_r;
+	reg  [3:0] eff_row_r;
+
+	// PIPELINE dx (write addr linebuf): sp_x (sign-extend condizionale da sp_w2)
+	// + tile_x_pf*16 e' STABILE per l'intero decode del tile -> registrato in
+	// SC_ROM_ADDR come dx_base_r. Nel DECODE dx = dx_base_r + eff_col -> somma
+	// corta. Evita che sp_x combinatorio arrivi fino al write-addr BRAM.
+	reg signed [10:0] dx_base_r;
 
 	// Tile code finale Y-MAJOR (MAME draw_internal: ax=outer, ay=inner, code++):
 	//   sub_index = ax*sizey + ay  →  cur_tile = code + eff_tile_x*sp_h + eff_tile_y
@@ -244,18 +259,28 @@ module GundamSD_sprite_renderer (
 					if (sp_enable && in_y && layer_en) begin
 						tile_x_pf <= 4'd0;
 						pf_side   <= 1'b0;
-						sc_state  <= SC_ROM_REQ;
+						sc_state  <= SC_ROM_ADDR;
 					end else begin
 						sc_state <= SC_NEXT_E;
 					end
 				end
 
+				// STADIO PIPELINE 1: registra cur_tile (mult + somme 14-bit) e eff_row.
+				// Path lungo isolato in questo ciclo dedicato.
+				SC_ROM_ADDR: begin
+					cur_tile_r <= cur_tile;
+					eff_row_r  <= eff_row;
+					dx_base_r  <= sp_x + ({6'd0, tile_x_pf, 4'd0});  // stabile per l'intero tile
+					sc_state   <= SC_ROM_REQ;
+				end
+
 				SC_ROM_REQ: begin
+					// STADIO PIPELINE 2: rom_addr da valori GIA' registrati.
 					// Sprite tile addr in SDRAM region (byte_offset relativo):
 					// tile_code * 128 (32 word) + (pf_side ? 64 byte : 0) + eff_row * 4
-					rom_addr <= ({4'd0, cur_tile, 7'd0})        // tile*128
+					rom_addr <= ({4'd0, cur_tile_r, 7'd0})      // tile*128 (registrato)
 					           + (pf_side ? 24'd64 : 24'd0)     // metà dx tile
-					           + ({18'd0, eff_row, 2'd0});       // row*4
+					           + ({18'd0, eff_row_r, 2'd0});     // row*4 (registrato)
 					rom_req  <= 1'b1;
 					sc_state <= SC_ROM_W;
 				end
@@ -296,7 +321,7 @@ module GundamSD_sprite_renderer (
 						// flipX: col_in_tile = 15 - col_in_tile
 						eff_col = sp_flipx ? (5'd15 - {pf_side, decode_step[2:0]})
 						                   : {pf_side, decode_step[2:0]};
-						dx = sp_x + ({6'd0, tile_x_pf, 4'd0}) + {6'd0, eff_col};
+						dx = dx_base_r + {6'd0, eff_col};
 
 						if (pen != 4'd15 && dx >= 0 && dx < 320) begin
 							if (active_buf == 1'b0)
@@ -311,17 +336,22 @@ module GundamSD_sprite_renderer (
 
 				SC_NEXT_TX: begin
 					if (pf_side == 1'b0) begin
-						// Appena finito metà sx → fai metà dx dello stesso tile
+						// Appena finito metà sx → fai metà dx dello STESSO tile.
+						// cur_tile non dipende da pf_side (solo rom_addr, +64) →
+						// cur_tile_r ancora valido → vai diretto a SC_ROM_REQ.
 						pf_side  <= 1'b1;
 						sc_state <= SC_ROM_REQ;
 					end else begin
-						// Finito anche metà dx → passa al prossimo tile_x o entry
+						// Finito anche metà dx → passa al prossimo tile_x o entry.
 						pf_side <= 1'b0;
 						if (tile_x_pf == sp_w - 4'd1) begin
 							sc_state <= SC_NEXT_E;
 						end else begin
+							// tile_x_pf cambia → cur_tile cambia → RIPASSA da
+							// SC_ROM_ADDR per ricalcolare cur_tile_r (altrimenti
+							// userei il tile precedente).
 							tile_x_pf <= tile_x_pf + 4'd1;
-							sc_state  <= SC_ROM_REQ;
+							sc_state  <= SC_ROM_ADDR;
 						end
 					end
 				end
@@ -358,11 +388,19 @@ module GundamSD_sprite_renderer (
 		end
 	end
 
-	// ─── Read side combinatoriale ────────────────────────────────────────────
-	wire [13:0] read_data = active_buf ? linebuf1[hpos[8:0]] : linebuf0[hpos[8:0]];
-	wire  [3:0] read_pen   = read_data[3:0];
-	wire  [1:0] read_pri   = read_data[7:6];
-	wire  [5:0] read_color = read_data[13:8];
+	// M10K read registrato (stabile). Leggo linebuf[hpos] e ritardo de/hpos di
+	// 1 ce_pix per compensare la latenza -> allineamento pixel CORRETTO.
+	reg [13:0] read_data;
+	reg        de_d;
+	reg        valid_d;
+	always @(posedge clk) if (ce_pix) begin
+		read_data <= active_buf ? linebuf1[hpos[8:0]] : linebuf0[hpos[8:0]];
+		de_d      <= de;
+		valid_d   <= layer_en & (hpos < 10'd320);
+	end
+	wire [3:0] read_pen   = read_data[3:0];
+	wire [1:0] read_pri   = read_data[7:6];
+	wire [5:0] read_color = read_data[13:8];
 
 	always @(posedge clk) begin
 		if (reset) begin
@@ -370,7 +408,7 @@ module GundamSD_sprite_renderer (
 			pen_index <= 11'd0;
 			pri_code  <= 2'd0;
 		end else if (ce_pix) begin
-			if (de & layer_en & (hpos < 10'd320) & (read_pen != 4'd15)) begin
+			if (de_d & valid_d & (read_pen != 4'd15)) begin
 				opaque    <= 1'b1;
 				pen_index <= {1'b0, read_color, read_pen};   // sprite palette base = 0
 				pri_code  <= read_pri;

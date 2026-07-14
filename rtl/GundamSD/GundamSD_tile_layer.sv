@@ -93,8 +93,8 @@ module GundamSD_tile_layer #(
 	// 12 bit/pixel: {color[3:0], 4'd0, pen[3:0]} → ricostruito al read in pen_index
 	// Bit10 (extra) per "pen=15 transparent" = bit 7 del campo a 12 bit (impostato da decode)
 	// Layout: [11:8]=color, [7]=transp_flag, [6:4]=000, [3:0]=pen
-	reg [11:0] linebuf0 [0:319];
-	reg [11:0] linebuf1 [0:319];
+	(* ramstyle = "M10K" *) reg [11:0] linebuf0 [0:319];
+	(* ramstyle = "M10K" *) reg [11:0] linebuf1 [0:319];
 	reg        active_buf;
 
 	// Prefetcher state
@@ -115,6 +115,7 @@ module GundamSD_tile_layer #(
 	localparam PF_DECODE  = 4'd6;
 	localparam PF_NEXT    = 4'd7;
 	localparam PF_DONE    = 4'd8;
+	localparam PF_ROM_ADDR = 4'd9;   // stadio pipeline: registra effective_tile_idx (spezza il path lungo)
 
 	// Coordinate prefetch — target = riga da mostrare al new_line successivo.
 	//
@@ -140,7 +141,7 @@ module GundamSD_tile_layer #(
 	localparam [8:0] V_VISIBLE = 9'd224;
 	wire [15:0] target_y = (vpos == V_VISIBLE - 9'd1) ? 16'd0
 	                                                  : ({7'd0, vpos} + 16'd1);
-	wire [15:0] eff_y_pf = target_y + scroll_y + {{6{yoff[9]}}, yoff};
+	wire [15:0] eff_y_pf = target_y + scroll_y_l + {{6{yoff[9]}}, yoff};
 	wire  [4:0] tile_y_pf = eff_y_pf[8:4];
 	wire  [3:0] row_pf    = eff_y_pf[3:0];
 
@@ -149,16 +150,45 @@ module GundamSD_tile_layer #(
 	wire vpos_visible    = (vpos < V_VISIBLE);
 	wire gated_new_line  = new_line & vpos_visible;
 
-	wire [4:0] first_tile_x   = scroll_x[8:4];
-	wire [3:0] first_pixel_off = scroll_x[3:0];
+	// FIX glitch (spec. MID layer): scroll_x/scroll_y/gfx_bank sono scritti dalla
+	// CPU in tempo reale. Usati LIVE, se la CPU li cambia DURANTE il prefetch di
+	// una riga (~1260 cicli) i tile della riga usano valori misti -> glitch. Il
+	// MG glitcha di piu' perche' e' l'unico con gfx_bank (bank tile, molto
+	// volatile). Fix: LATCH dei 3 valori all'inizio del prefetch di ogni riga
+	// (gated_new_line / PF_DONE swap), stabili per tutta la riga.
+	reg [15:0] scroll_x_l, scroll_y_l, gfx_bank_l;
+	wire pf_line_start = (pf_state == PF_IDLE || pf_state == PF_DONE) && gated_new_line;
+	always @(posedge clk) if (reset) begin
+		scroll_x_l <= 16'd0; scroll_y_l <= 16'd0; gfx_bank_l <= 16'd0;
+	end else if (pf_line_start) begin
+		scroll_x_l <= scroll_x;
+		scroll_y_l <= scroll_y;
+		gfx_bank_l <= gfx_bank;
+	end
+
+	wire [4:0] first_tile_x   = scroll_x_l[8:4];
+	wire [3:0] first_pixel_off = scroll_x_l[3:0];
 
 	wire [4:0] cur_tile_x = first_tile_x + tile_col_pf;
 	wire signed [10:0] dst_x_signed = ({1'b0, tile_col_pf, 4'd0}) - {7'd0, first_pixel_off} + {{1{xoff[9]}}, xoff};
 
 	// Tile index con eventuale gfx_bank (MG ha bit 12 = 13-bit totali, BG/FG = 12 bit)
 	wire [12:0] effective_tile_idx = HAS_GFX_BANK
-	                                  ? ({1'b0, pf_tile_idx} | gfx_bank[12:0])
+	                                  ? ({1'b0, pf_tile_idx} | gfx_bank_l[12:0])
 	                                  : {1'b0, pf_tile_idx};
+
+	// PIPELINE rom_addr: effective_tile_idx (OR con gfx_bank, poi <<7) registrato
+	// in uno stadio dedicato (PF_ROM_ADDR). Cosi' PF_ROM_REQ calcola rom_addr da
+	// un valore GIA' registrato -> path corto, chiude a 96 MHz. MG (HAS_GFX_BANK)
+	// e' quello che glitchava di piu': gfx_bank allarga il termine idx<<7.
+	reg [12:0] eff_tile_idx_r;
+
+	// PIPELINE dx (write addr linebuf): dst_x_signed dipende da tile_col_pf,
+	// scroll_x_l, xoff -> STABILE per tutto il decode del tile (8 pixel). Lo
+	// registro una volta in PF_ROM_ADDR. Nel DECODE dx = dst_x_base_r + side +
+	// step -> somma corta. Prima dst_x_signed (sottrazione+2 somme 11-bit) era
+	// combinatorio DENTRO il decode fino al write-addr BRAM -> path -0.83.
+	reg signed [10:0] dst_x_base_r;
 
 	// ─── Prefetcher main FSM ─────────────────────────────────────────────────
 	always @(posedge clk) begin
@@ -198,14 +228,23 @@ module GundamSD_tile_layer #(
 					// vram_data ora valido (= dato di addr emesso in PF_VRAM_R).
 					pf_tile_idx <= vram_data[11:0];
 					pf_tile_clr <= vram_data[15:12];
-					pf_state    <= PF_ROM_REQ;
+					pf_state    <= PF_ROM_ADDR;
+				end
+
+				// STADIO PIPELINE 1: registra effective_tile_idx. pf_tile_idx e'
+				// appena diventato valido (registrato in PF_VRAM_W2) -> qui e' stabile.
+				PF_ROM_ADDR: begin
+					eff_tile_idx_r <= effective_tile_idx;
+					dst_x_base_r   <= dst_x_signed;   // stabile per l'intero tile
+					pf_state       <= PF_ROM_REQ;
 				end
 
 				PF_ROM_REQ: begin
+					// STADIO PIPELINE 2: rom_addr da eff_tile_idx_r GIA' registrato.
 					// rom_addr = tile_idx*128 + side_off + row*4
 					// effective_tile_idx = 13 bit (MG con bank ha tile fino a 8191)
 					// idx*128 = idx<<7. Con idx 13 bit, idx*128 sta in 20 bit.
-					rom_addr <= ({4'd0, effective_tile_idx, 7'd0})
+					rom_addr <= ({4'd0, eff_tile_idx_r, 7'd0})
 					           + (pf_side ? 24'd64 : 24'd0)
 					           + ({18'd0, row_pf, 2'd0});
 					rom_req  <= 1'b1;
@@ -251,7 +290,7 @@ module GundamSD_tile_layer #(
 						pen[0] = byte_hi[3 - {1'b0, sub}];   // plane 0
 						pen[1] = byte_hi[7 - {1'b0, sub}];   // plane 1
 						transp = (HAS_TRANSP != 0) && (pen == 4'd15);
-						dx = dst_x_signed + (pf_side ? 11'sd8 : 11'sd0) + {8'd0, decode_step[2:0]};
+						dx = dst_x_base_r + (pf_side ? 11'sd8 : 11'sd0) + {8'd0, decode_step[2:0]};
 						if (dx >= 0 && dx < 320) begin
 							if (active_buf == 1'b0)
 								linebuf1[dx[8:0]] <= {pf_tile_clr, transp, 3'd0, pen};
@@ -295,18 +334,28 @@ module GundamSD_tile_layer #(
 		end
 	end
 
-	// ─── Read side ─────────────────────────────────────────────────────────
-	wire [11:0] read_data  = active_buf ? linebuf1[hpos[8:0]] : linebuf0[hpos[8:0]];
-	wire  [3:0] read_color = read_data[11:8];
-	wire        read_transp = read_data[7];
-	wire  [3:0] read_pen   = read_data[3:0];
+	// ─── Read side REGISTRATO (M10K, stabile, latenza compensata) ────────────
+	// Linebuf forzato M10K e letto in modo REGISTRATO (read-port sincrono) ->
+	// M10K read registrato (stabile). Leggo linebuf[hpos] e ritardo de/hpos di
+	// 1 ce_pix per compensare la latenza -> allineamento pixel CORRETTO.
+	reg [11:0] read_data;
+	reg        de_d;
+	reg        valid_d;
+	always @(posedge clk) if (ce_pix) begin
+		read_data <= active_buf ? linebuf1[hpos[8:0]] : linebuf0[hpos[8:0]];
+		de_d      <= de;
+		valid_d   <= layer_en & (hpos < 10'd320);
+	end
+	wire [3:0] read_color = read_data[11:8];
+	wire       read_transp = read_data[7];
+	wire [3:0] read_pen   = read_data[3:0];
 
 	always @(posedge clk) begin
 		if (reset) begin
 			opaque    <= 1'b0;
 			pen_index <= 11'd0;
 		end else if (ce_pix) begin
-			if (de & layer_en & (hpos < 10'd320) & ~read_transp) begin
+			if (de_d & valid_d & ~read_transp) begin
 				opaque    <= 1'b1;
 				pen_index <= COLOR_BASE + {3'd0, read_color, read_pen};
 			end else begin

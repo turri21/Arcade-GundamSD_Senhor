@@ -266,6 +266,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/GundamSD/GundamSD_text_render
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/GundamSD/GundamSD_tile_layer.sv
 # Sprite renderer SEI0211: 256 entry × 4 word, 16x16 4bpp multi-tile, priority 2-bit
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/GundamSD/GundamSD_sprite_renderer.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/GundamSD/crt_adjust.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/GundamSD/pause_overlay.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/GundamSD/pause_text.sv
 set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_68kdtack_cen.v

@@ -233,6 +233,10 @@ localparam CONF_STR = {
 	"P1O[7:5],Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer,HV-Integer;",
 	"P1O[19],Refresh Rate,Original 59.4Hz,60Hz;",
 	"P1O[18],Clean Pause,Off,On;",
+	"P1O[101],CRT Adjust,Off,On;",
+	"H1P1O[100:96],CRT H-Size,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
+	"H1P1O[85:79],CRT H-Position,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,+16,+17,+18,+19,+20,+21,+22,+23,+24,+25,+26,+27,+28,+29,+30,+31,+32,+33,+34,+35,+36,+37,+38,+39,+40,+41,+42,+43,+44,+45,+46,+47,+48,-48,-47,-46,-45,-44,-43,-42,-41,-40,-39,-38,-37,-36,-35,-34,-33,-32,-31,-30,-29,-28,-27,-26,-25,-24,-23,-22,-21,-20,-19,-18,-17,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
+	"H1P1O[78:74],CRT V-Shift,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
 	"-;",
 	"DIP;",
 	"-;",
@@ -278,7 +282,7 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.forced_scandoubler(forced_scandoubler),
 	.buttons(buttons),
 	.status(status),
-	.status_menumask(16'd0),
+	.status_menumask({14'd0, ~status[101], 1'b0}),
 	.ps2_key(ps2_key),
 	.joystick_0(joy0),
 	.joystick_1(joy1),
@@ -837,12 +841,11 @@ wire [7:0] video_g = video_de ? pal_b_g : 8'h00;
 wire [7:0] video_b = video_de ? pal_b_b : 8'h00;
 
 assign CLK_VIDEO = clk_sys;
-assign CE_PIXEL  = ce_pix;
-assign VGA_HS    = HSync;
-assign VGA_VS    = VSync;
+assign CE_PIXEL  = crt_on ? rd_ce : ce_pix;
 
 // Pause overlay: dim video + logo + SUPPORTERS + patron scroll.
-// Modulo standalone 8-bit RGB. OSD "Clean Pause" (status[18]): ON=raw, OFF=overlay.
+// Output su bus av_r/g/b, poi direttamente ai pin VGA_R/G/B.
+wire [7:0] av_r, av_g, av_b;
 pause_overlay u_pause_ovl (
 	.clk       (clk_sys),
 	.pause     (pause),
@@ -853,10 +856,99 @@ pause_overlay u_pause_ovl (
 	.rgb_r_in  (video_r),
 	.rgb_g_in  (video_g),
 	.rgb_b_in  (video_b),
-	.rgb_r_out (VGA_R),
-	.rgb_g_out (VGA_G),
-	.rgb_b_out (VGA_B)
+	.rgb_r_out (av_r),
+	.rgb_g_out (av_g),
+	.rgb_b_out (av_b)
 );
+
+// ── Analog H-Size + H-Position + V-Shift (modulo unico, pattern Raiden) ──────
+// Tutti i controlli spostano/scalano il CONTENUTO lasciando i sync nativi
+// (H-Size: read rate; H-Pos: rd_addr; V-Shift: shreg VSync). Nessun desync CRT.
+localparam int H_TOTAL_GD = 384;
+localparam int V_TOTAL_GD = 263;
+
+// ON/OFF (status[101]): OFF = bypass nativo, ON = modulo attivo (i controlli
+// funzionano anche con valori a 0).
+reg crt_on;
+always @(posedge clk_sys) if (ce_pix) crt_on <= status[101];
+
+// H-Size bidirezionale (status[100:96], two's complement 5-bit): 0 = nativo,
+// +1..+15 = enlarge (read piu' lento), -1..-16 = shrink (read piu' veloce).
+reg signed [4:0] hsize_s;
+always @(posedge clk_sys) if (ce_pix) hsize_s <= $signed(status[100:96]);
+
+// H-Position (status[85:79], 7 bit): sposta il contenuto orizzontale. Encoding
+// 0..48 = +0..+48 (destra), 79..127 = -48..-1 (sinistra).
+reg [6:0] hpos_d;
+always @(posedge clk_sys) if (ce_pix) hpos_d <= status[85:79];
+wire signed [8:0] hpos_off = (hpos_d <= 7'd48)
+	? $signed({2'b0, hpos_d})
+	: $signed({2'b0, hpos_d}) - 9'sd128;
+
+// V-Shift (status[78:74], signed 5-bit -16..+15 righe) -> passato al modulo.
+reg signed [5:0] vshift_off;
+always @(posedge clk_sys) if (ce_pix) vshift_off <= $signed(status[78:74]);
+
+// Read rate a QUARTI di ciclo (step 1.56%), accumulatore. Periodo = (64+hsize)
+// quarti. Reset sull'HSync nativo -> pattern deterministico per riga.
+wire line_tick = ce_pix && (timing_hpos == 10'(H_TOTAL_GD - 1));
+reg HSync_d;
+always @(posedge clk_sys) HSync_d <= HSync;
+wire native_hs_rise = HSync & ~HSync_d;
+wire [7:0] rd_period = 8'd64 + {{3{hsize_s[4]}}, hsize_s};  // hsize -16..+15 -> 48..79 quarti
+reg  [7:0] rd_acc;
+wire rd_tick = (rd_acc + 8'd4) >= {1'b0, rd_period};
+always @(posedge clk_sys) begin
+	if      (native_hs_rise) rd_acc <= 8'd0;
+	else if (rd_tick)        rd_acc <= rd_acc + 8'd4 - {1'b0, rd_period};
+	else                     rd_acc <= rd_acc + 8'd4;
+end
+wire rd_ce = crt_on ? rd_tick : ce_pix;
+
+wire [7:0] str_r, str_g, str_b;
+wire       str_hs, str_vs, str_hb, str_vb;
+crt_adjust #(.VTOTAL(V_TOTAL_GD)) u_crt_adjust (
+	.clk      (clk_sys),
+	.pxl_cen  (ce_pix),
+	.pxl2_cen (rd_ce),
+	.active   (crt_on),
+	.hsize    (hsize_s),
+	.hoffset  (hpos_off),
+	.voffset  (vshift_off),
+	.r_in     (av_r), .g_in (av_g), .b_in (av_b),
+	.hs_in    (HSync),           // HSync NATIVO -> no desync
+	.vs_in    (VSync),
+	.hb_in    (HBlank | VBlank),
+	.vb_in    (VBlank),
+	.r_out    (str_r), .g_out (str_g), .b_out (str_b),
+	.hs_out   (str_hs), .vs_out (str_vs),
+	.hb_out   (str_hb), .vb_out (str_vb)
+);
+
+// Finestra DE per l'OSD: apre all'attivo nativo (ritardato 1 riga), chiude a
+// larghezza stretchata piena (pattern Blood Bros).
+reg vblank_1l;
+always @(posedge clk_sys) if (line_tick) vblank_1l <= VBlank;
+wire native_active = ~(HBlank | vblank_1l);
+reg  native_active_d;
+always @(posedge clk_sys) if (ce_pix) native_active_d <= native_active;
+wire native_rise = native_active & ~native_active_d;
+wire str_active = ~str_hb;
+reg  str_active_d;
+always @(posedge clk_sys) if (rd_ce) str_active_d <= str_active;
+wire str_fall = str_active_d & ~str_active;
+reg de_osd;
+always @(posedge clk_sys) begin
+	if      (native_rise) de_osd <= 1'b1;
+	else if (str_fall)    de_osd <= 1'b0;
+end
+
+// Output: ON -> dal modulo; OFF -> nativo.
+assign VGA_R  = crt_on ? str_r  : av_r;
+assign VGA_G  = crt_on ? str_g  : av_g;
+assign VGA_B  = crt_on ? str_b  : av_b;
+assign VGA_HS = crt_on ? str_hs : HSync;
+assign VGA_VS = crt_on ? str_vs : VSync;
 
 // Aspect ratio: Original = 4:3 arcade display, Full Screen = 0:0
 wire [11:0] arx = (!ar) ? 12'd4 : (ar - 1'd1);
@@ -867,14 +959,14 @@ wire [11:0] ary = (!ar) ? 12'd3 : 12'd0;
 video_freak video_freak
 (
 	.CLK_VIDEO(clk_sys),
-	.CE_PIXEL(ce_pix),
+	.CE_PIXEL(crt_on ? rd_ce : ce_pix),
 	.VGA_VS(VSync),
 	.HDMI_WIDTH(HDMI_WIDTH),
 	.HDMI_HEIGHT(HDMI_HEIGHT),
 	.VGA_DE(VGA_DE),
 	.VIDEO_ARX(VIDEO_ARX),
 	.VIDEO_ARY(VIDEO_ARY),
-	.VGA_DE_IN(~(HBlank | VBlank)),
+	.VGA_DE_IN(crt_on ? de_osd : ~(HBlank | VBlank)),
 	.ARX(arx),
 	.ARY(ary),
 	.CROP_SIZE(12'd0),
