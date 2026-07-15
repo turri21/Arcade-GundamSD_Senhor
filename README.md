@@ -1,3 +1,8 @@
+-=(GundamSD_Senhor notes)=-
+
+Tested: Working Video 720p, 1080p & Sound.
+
+___
 # Arcade-GundamSD_MiSTer
 
 FPGA core for **SD Gundam Psycho Salamander no Kyoui** (Banpresto / Bandai,
